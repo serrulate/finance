@@ -1,28 +1,45 @@
 from pathlib import Path
+import os
+from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from datetime import date, timedelta
 
-# --- Simple password gate using Streamlit secrets ---
-PASSWORD = st.secrets["general"]["app_password"]
+st.set_page_config(page_title="Finance Budget App", layout="wide")
+
+# ------------------------------------------------------------------------------
+# Password gate (robust: secrets -> env -> dev fallback)
+# ------------------------------------------------------------------------------
+PASSWORD = None
+try:
+    PASSWORD = st.secrets.get("general", {}).get("app_password", None)
+except Exception:
+    PASSWORD = None
+
+if PASSWORD is None:
+    PASSWORD = os.environ.get("APP_PASSWORD")
+
+DEV_FALLBACK = None  # set to a string like "dev" if you want a local fallback
+if PASSWORD is None and DEV_FALLBACK:
+    st.warning("No password configured; using development fallback.")
+    PASSWORD = DEV_FALLBACK
+
+if PASSWORD is None:
+    st.error("Password is not configured. Set [general].app_password in Secrets (or APP_PASSWORD env).")
+    st.stop()
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    pwd = st.text_input("Enter password:", type="password")
-    if pwd == PASSWORD:
+    pw = st.text_input("Enter password:", type="password")
+    if pw == PASSWORD:
         st.session_state.authenticated = True
         st.success("Access granted!")
+        st.rerun()
     else:
         st.stop()
-
-
-
-
-st.set_page_config(page_title="Finance Budget App", layout="wide")
 
 # ------------------------------------------------------------------------------
 # Paths
@@ -31,7 +48,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA = APP_DIR.parent / "Data" / "finance_table.xlsx"  # your default file
 
 # ------------------------------------------------------------------------------
-# Helpers: IO & cleaning
+# IO & cleaning helpers
 # ------------------------------------------------------------------------------
 @st.cache_data
 def read_excel_any(path_or_bytes):
@@ -65,7 +82,7 @@ def coerce_types(df):
 def prune_and_split(df):
     """
     - Drop AMEXPAYMENT rows (case-insensitive)
-    - Split Income vs Expenses (Category == INCOME)
+    - Split Income vs Expenses by Category == INCOME
     - Ensure 'month'
     - If expenses are negative overall, flip to positive
     """
@@ -86,7 +103,7 @@ def prune_and_split(df):
     return df_exp, df_inc
 
 # ------------------------------------------------------------------------------
-# Date presets & filtering
+# Date helpers
 # ------------------------------------------------------------------------------
 def get_data_bounds(df_all):
     dates = df_all["date"].dropna()
@@ -119,58 +136,18 @@ def clamp_to_window(d: date, start: date, end: date):
         return end, True
     return d, False
 
+def prev_year_safe(d: date) -> date:
+    """Return the same month/day in the previous year, with a safe Feb 29 fallback."""
+    try:
+        return d.replace(year=d.year - 1)
+    except ValueError:
+        if d.month == 2 and d.day == 29:
+            return d.replace(year=d.year - 1, day=28)
+        return d - timedelta(days=365)
+
 # ------------------------------------------------------------------------------
-# Budget logic — simplified (adjust=0 fixed, others reduced by slider)
+# Computations
 # ------------------------------------------------------------------------------
-def compute_budget_simplified(exp_df: pd.DataFrame, reduction_pct: float):
-    """
-    For each category (expenses only):
-      - Total_Spent = sum since Start_Tracking_Date (already filtered before call)
-      - Budgeted_Spent = Total_Spent if adjust==0 else Total_Spent*(1 - reduction_pct)
-      - Delta = Budgeted_Spent - Total_Spent (rounded to 2 decimals for display)
-    Returns (budget_table_with_totals, base_table_no_totals)
-    """
-    if exp_df.empty:
-        columns = ["category","total_spent","budgeted_spent","delta"]
-        return pd.DataFrame(columns=columns), pd.DataFrame(columns=columns)
-
-    # Aggregate by category
-    base = (exp_df.groupby("category", as_index=False)
-            .agg(total_spent=("amount","sum"),
-                 adjust=("adjust","max")))
-
-    # Apply simplified rule
-    factor = 1.0 - float(reduction_pct)
-    base["budgeted_spent"] = np.where(base["adjust"]==0,
-                                      base["total_spent"],
-                                      base["total_spent"] * factor)
-    base["delta"] = base["budgeted_spent"] - base["total_spent"]
-
-    out = base[["category","total_spent","budgeted_spent","delta"]].copy()
-
-    # Totals row
-    total_row = pd.DataFrame({
-        "category": ["TOTAL"],
-        "total_spent": [out["total_spent"].sum()],
-        "budgeted_spent": [out["budgeted_spent"].sum()],
-        "delta": [out["delta"].sum()]
-    })
-    out_totals = pd.concat([out, total_row], ignore_index=True)
-
-    # Round delta to 2 decimals for display
-    out_totals["delta"] = out_totals["delta"].round(2)
-    out["delta"] = out["delta"].round(2)
-
-    return out_totals, out
-
-def monthly_actuals_by_category(exp_df: pd.DataFrame):
-    if exp_df.empty:
-        return pd.DataFrame(columns=["month","category","actual_spent"])
-    m = (exp_df.groupby(["month","category"], as_index=False)
-         .agg(actual_spent=("amount","sum")))
-    m["month"] = m["month"].astype(str)
-    return m
-
 def monthly_income_vs_expenses(exp_df: pd.DataFrame, inc_df: pd.DataFrame):
     m_exp = (exp_df.groupby("month", as_index=False)
              .agg(expenses=("amount","sum"))) if not exp_df.empty else pd.DataFrame(columns=["month","expenses"])
@@ -185,13 +162,21 @@ def monthly_income_vs_expenses(exp_df: pd.DataFrame, inc_df: pd.DataFrame):
     out["savings_rate"] = np.where(out["income"]>0, out["net"]/out["income"], np.nan)
     return out.sort_values("month")
 
-def monthly_proposed_from_seasonality(budget_table_no_totals: pd.DataFrame, exp_df: pd.DataFrame):
+def monthly_actuals_by_category(exp_df: pd.DataFrame):
+    if exp_df.empty:
+        return pd.DataFrame(columns=["month","category","actual_spent"])
+    m = (exp_df.groupby(["month","category"], as_index=False)
+         .agg(actual_spent=("amount","sum")))
+    m["month"] = m["month"].astype(str)
+    return m
+
+def monthly_proposed_from_seasonality_goals(goal_table: pd.DataFrame, exp_df: pd.DataFrame):
     """
-    Spread each category’s annual *budgeted_spent* across observed months using
-    historical expense shares; even split if no history.
-    Expects a budget table WITHOUT the TOTAL row.
+    Spread each category’s 'goal_budget' across observed months (in the current window),
+    using historical expense shares; even split if no history.
+    Expects goal_table with columns: ['category','goal_budget'] (no TOTAL row).
     """
-    if budget_table_no_totals.empty or exp_df.empty:
+    if goal_table.empty or exp_df.empty:
         return pd.DataFrame(columns=["month","category","proposed_budget"])
 
     hist = (exp_df.groupby(["category","month"], as_index=False)
@@ -207,38 +192,79 @@ def monthly_proposed_from_seasonality(budget_table_no_totals: pd.DataFrame, exp_
 
     months = sorted(hist["month"].unique())
     rows = []
-    for _, r in budget_table_no_totals.iterrows():
+    for _, r in goal_table.iterrows():
         cat = r["category"]
-        annual_budget = float(r["budgeted_spent"])
+        annual_goal = float(r["goal_budget"])
         shares = hist[hist["category"]==cat][["month","share"]]
         if shares.empty:
             if months:
                 for mo in months:
-                    rows.append({"month": mo, "category": cat, "proposed_budget": annual_budget/12.0})
+                    rows.append({"month": mo, "category": cat, "proposed_budget": annual_goal/12.0})
         else:
             for _, s in shares.iterrows():
-                rows.append({"month": s["month"], "category": cat, "proposed_budget": annual_budget * float(s["share"])})
+                rows.append({"month": s["month"], "category": cat, "proposed_budget": annual_goal * float(s["share"])})
 
     out = pd.DataFrame(rows)
     if not out.empty:
         out = out.groupby(["month","category"], as_index=False)["proposed_budget"].sum()
     return out
 
+def build_budget_window_comparison(exp_now: pd.DataFrame, exp_prev: pd.DataFrame, reduction_pct: float):
+    """
+    Returns a table with:
+      category, total_spent, total_spent_last_year, goal_budget, delta_goal, delta_actual
+    - goal_budget = total_spent_last_year * (1 - reduction_pct)
+    - delta_goal  = total_spent - goal_budget
+    - delta_actual = total_spent - total_spent_last_year
+    Includes a final TOTAL row. Deltas rounded to 2 decimals.
+    """
+    cols = ["category","total_spent","total_spent_last_year","goal_budget","delta_goal","delta_actual"]
+    if exp_now.empty and exp_prev.empty:
+        return pd.DataFrame(columns=cols)
+
+    now = (exp_now.groupby("category", as_index=False)
+                 .agg(total_spent=("amount","sum"))) if not exp_now.empty else pd.DataFrame(columns=["category","total_spent"])
+
+    prev = (exp_prev.groupby("category", as_index=False)
+                 .agg(total_spent_last_year=("amount","sum"))) if not exp_prev.empty else pd.DataFrame(columns=["category","total_spent_last_year"])
+
+    merged = pd.merge(now, prev, on="category", how="outer").fillna(0.0)
+
+    merged["goal_budget"] = merged["total_spent_last_year"] * (1.0 - float(reduction_pct))
+    merged["delta_goal"] = merged["total_spent"] - merged["goal_budget"]
+    merged["delta_actual"] = merged["total_spent"] - merged["total_spent_last_year"]
+
+    out = merged[["category","total_spent","total_spent_last_year","goal_budget","delta_goal","delta_actual"]].copy()
+
+    totals = pd.DataFrame({
+        "category": ["TOTAL"],
+        "total_spent": [out["total_spent"].sum()],
+        "total_spent_last_year": [out["total_spent_last_year"].sum()],
+        "goal_budget": [out["goal_budget"].sum()],
+        "delta_goal": [out["delta_goal"].sum()],
+        "delta_actual": [out["delta_actual"].sum()]
+    })
+
+    out = pd.concat([out, totals], ignore_index=True)
+
+    out["delta_goal"] = out["delta_goal"].round(2)
+    out["delta_actual"] = out["delta_actual"].round(2)
+    return out
+
 # ------------------------------------------------------------------------------
-# UI — Inputs
+# UI — Data load
 # ------------------------------------------------------------------------------
 st.title("💸 Finance Budget App")
 
 st.write(
     "Defaults to **Data/finance_table.xlsx**. "
-    "Upload another Excel (same columns) to test."
+    "You can upload another Excel to test."
 )
 
 with st.sidebar:
     st.header("Data")
     upl = st.file_uploader("Upload Excel (.xlsx) [optional]", type=["xlsx"])
 
-# Load & clean
 try:
     if upl is not None:
         raw = read_excel_any(upl)
@@ -260,7 +286,7 @@ if raw["date"].dropna().empty:
 st.caption(src)
 
 # ------------------------------------------------------------------------------
-# Sidebar — Date Presets, Custom Range, Start_Tracking_Date, Reduction
+# Sidebar — Date controls and tracking dates
 # ------------------------------------------------------------------------------
 min_date, max_date = get_data_bounds(raw)
 
@@ -281,51 +307,74 @@ with st.sidebar:
     else:
         start_d, end_d = preset_range(preset, min_date, max_date)
 
+    # Tracking window (START & END)
     st.markdown("---")
     st.header("Tracking")
     start_track = st.date_input(
         "Start_Tracking_Date",
         value=start_d, min_value=min_date, max_value=max_date,
-        help="Annual Budget Plan totals begin on this date."
+        help="Tables/charts accumulate from this date."
     )
+    end_track = st.date_input(
+        "End_Tracking_Date",
+        value=end_d, min_value=min_date, max_value=max_date,
+        help="Tables/charts accumulate up to this date."
+    )
+
+    if end_track < start_track:
+        st.info("End_Tracking_Date was before Start_Tracking_Date. Swapping the two.")
+        start_track, end_track = end_track, start_track
+
+    start_track_clamped, clamped_s = clamp_to_window(start_track, start_d, end_d)
+    end_track_clamped, clamped_e = clamp_to_window(end_track, start_d, end_d)
+    if clamped_s or clamped_e:
+        st.info(f"Tracking dates adjusted to window: {start_track_clamped} → {end_track_clamped}")
+
     st.markdown("---")
     reduction_pct = st.slider("Target expense reduction (%)", 0, 50, 15, 1) / 100.0
-    st.caption("Rules: INCOME excluded from expense budget; AMEXPAYMENT dropped; categories with adjust=0 are fixed; all other categories reduced by the slider.")
-
-# Clamp Start_Tracking_Date to window
-start_track_clamped, clamped = clamp_to_window(start_track, start_d, end_d)
-if clamped:
-    st.info(f"Start_Tracking_Date adjusted to be within the analysis window: {start_track_clamped}")
+    st.caption("INCOME excluded from expense budgeting; AMEXPAYMENT removed. "
+               "Budget Plan compares the current tracked window vs the same dates last year.")
 
 # ------------------------------------------------------------------------------
-# Apply filters (window + tracking) and split
+# Apply analysis window & tracking slices
 # ------------------------------------------------------------------------------
+# First, analysis window
 raw_win = raw[(raw["date"].dt.date >= start_d) & (raw["date"].dt.date <= end_d)].copy()
-mask_track = (raw_win["date"].dt.date >= start_track_clamped)
-raw_tracked = raw_win.loc[mask_track].copy()
 
+# Current tracked slice
+mask_now = (raw_win["date"].dt.date >= start_track_clamped) & (raw_win["date"].dt.date <= end_track_clamped)
+raw_tracked = raw_win.loc[mask_now].copy()
+
+# Previous-year tracked slice (same day range, prior year)
+start_prev = prev_year_safe(start_track_clamped)
+end_prev = prev_year_safe(end_track_clamped)
+mask_prev = (raw["date"].dt.date >= start_prev) & (raw["date"].dt.date <= end_prev)
+raw_prev_tracked = raw.loc[mask_prev].copy()
+
+# Split / prune AMEXPAYMENT & INCOME
 ExpTracked, IncTracked = prune_and_split(raw_tracked)
+ExpPrev, IncPrev = prune_and_split(raw_prev_tracked)
 
 if ExpTracked.empty and IncTracked.empty:
-    st.warning("No rows in the selected range starting from Start_Tracking_Date.")
+    st.warning("No rows in the selected current tracking range.")
     st.stop()
 
 # ------------------------------------------------------------------------------
-# Metrics (from TRACKED slice)
+# Metrics (from current tracked slice)
 # ------------------------------------------------------------------------------
 total_income = float(IncTracked["amount"].sum()) if not IncTracked.empty else 0.0
 total_expenses_actual = float(ExpTracked["amount"].sum()) if not ExpTracked.empty else 0.0
 net_total = total_income - total_expenses_actual
 savings_rate = (net_total/total_income) if total_income > 0 else np.nan
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric(f"Total Income ({preset})", f"${total_income:,.0f}")
-col2.metric(f"Total Expenses ({preset})", f"${total_expenses_actual:,.0f}")
-col3.metric("Net (Income − Expenses)", f"${net_total:,.0f}")
-col4.metric("Savings Rate", f"{savings_rate:.1%}" if pd.notnull(savings_rate) else "—")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric(f"Total Income ({start_track_clamped} → {end_track_clamped})", f"${total_income:,.0f}")
+c2.metric(f"Total Expenses ({start_track_clamped} → {end_track_clamped})", f"${total_expenses_actual:,.0f}")
+c3.metric("Net (Income − Expenses)", f"${net_total:,.0f}")
+c4.metric("Savings Rate", f"{savings_rate:.1%}" if pd.notnull(savings_rate) else "—")
 
 # ------------------------------------------------------------------------------
-# Income vs Expenses — Monthly (TRACKED)
+# Income vs Expenses — Monthly (current tracked)
 # ------------------------------------------------------------------------------
 st.markdown("### Income vs Expenses — Monthly")
 m_ie = monthly_income_vs_expenses(ExpTracked, IncTracked)
@@ -338,28 +387,34 @@ else:
     st.plotly_chart(fig_net, use_container_width=True)
 
 # ------------------------------------------------------------------------------
-# Annual Expense Budget Plan — Simplified (TRACKED)
+# Annual Expense Budget Plan — Window vs Previous Year
 # ------------------------------------------------------------------------------
-st.markdown("### Annual Expense Budget Plan (Simplified)")
-bp_with_totals, bp_no_totals = compute_budget_simplified(ExpTracked, reduction_pct=reduction_pct)
-if bp_with_totals.empty:
-    st.info("No expense categories to show.")
+st.markdown("### Annual Expense Budget Plan — Window vs Previous Year")
+bp_compare = build_budget_window_comparison(ExpTracked, ExpPrev, reduction_pct=reduction_pct)
+
+if bp_compare.empty:
+    st.info("No expense categories to show for the selected windows.")
 else:
-    # nicer formatting
-    show = bp_with_totals.copy()
-    money_cols = ["total_spent","budgeted_spent"]
+    display = bp_compare.copy()
+    money_cols = ["total_spent","total_spent_last_year","goal_budget","delta_goal","delta_actual"]
     for c in money_cols:
-        show[c] = show[c].round(2)
-    st.dataframe(show.sort_values("category"), use_container_width=True)
+        display[c] = display[c].round(2)
+    st.dataframe(display.sort_values("category"), use_container_width=True)
 
 # ------------------------------------------------------------------------------
-# Monthly Expenses by Category — Actuals / Proposed (TRACKED)
+# Monthly Expenses by Category — Actuals / Proposed (current tracked)
 # ------------------------------------------------------------------------------
 st.markdown("### Monthly Expenses by Category")
 view_mode = st.radio("View", ["Actuals","Proposed"], horizontal=True)
 
 monthly_actuals = monthly_actuals_by_category(ExpTracked)
-monthly_proposed = monthly_proposed_from_seasonality(bp_no_totals, ExpTracked)
+
+# Build the per-category goals (exclude TOTAL row)
+goals_no_total = pd.DataFrame(columns=["category","goal_budget"])
+if not bp_compare.empty:
+    goals_no_total = bp_compare[bp_compare["category"]!="TOTAL"][["category","goal_budget"]].copy()
+
+monthly_proposed = monthly_proposed_from_seasonality_goals(goals_no_total, ExpTracked)
 
 if view_mode == "Actuals":
     if monthly_actuals.empty:
@@ -375,7 +430,6 @@ else:
     else:
         fig_p = px.bar(monthly_proposed, x="month", y="proposed_budget", color="category", barmode="stack")
         st.plotly_chart(fig_p, use_container_width=True)
-        # Optional variance table if you also want to compare to actuals
         if not monthly_actuals.empty:
             var = pd.merge(
                 monthly_actuals.rename(columns={"actual_spent":"Actual"}),
@@ -397,11 +451,11 @@ if not m_ie.empty:
         file_name="monthly_income_vs_expenses.csv",
         mime="text/csv"
     )
-if not bp_with_totals.empty:
+if not bp_compare.empty:
     st.download_button(
-        "Download Annual Expense Budget Plan (Simplified)",
-        bp_with_totals.to_csv(index=False).encode("utf-8"),
-        file_name="annual_expense_budget_simplified.csv",
+        "Download Annual Expense Budget Plan (Window vs Previous Year)",
+        bp_compare.to_csv(index=False).encode("utf-8"),
+        file_name="annual_expense_budget_window_vs_prev_year.csv",
         mime="text/csv"
     )
 if not monthly_actuals.empty:
