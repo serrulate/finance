@@ -1,0 +1,10 @@
+venv_finance/
+.venv/
+__pycache__/
+*.pyc
+Data/pdata
+# Streamlit secrets (keep local)
+.streamlit/secrets.toml
+ApplyCat.py
+tables.py
+pbi1.pbix
