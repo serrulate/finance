@@ -70,14 +70,31 @@ def stdcols(df):
 
 def coerce_types(df):
     df = df.copy()
+    # dates
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # numeric coercions
+    if "balanceamount" in df.columns:
+        df["balanceamount"] = pd.to_numeric(df["balanceamount"], errors="coerce")
     if "amount" in df.columns:
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+
+    # flags
     df["limit"]  = pd.to_numeric(df.get("limit", 0), errors="coerce").fillna(0).astype(int)
     df["adjust"] = pd.to_numeric(df.get("adjust", 1), errors="coerce").fillna(1).astype(int)
     df["category"] = df["category"].astype(str)
+
+    # unify on a single column for all downstream logic:
+    # prefer BalanceAmount if present; otherwise fall back to Amount
+    if "balanceamount" in df.columns:
+        df["amount"] = df["balanceamount"]
+    elif "amount" not in df.columns:
+        # if neither exists, create it so downstream doesn’t crash
+        df["amount"] = np.nan
+
     return df
+
 
 def prune_and_split(df):
     """
