@@ -8,3 +8,8 @@ Data/pdata
 ApplyCat.py
 tables.py
 pbi1.pbix
+finance_tableold.xlsx
+old_data/
+boa.csv
+process_transactions.py
+transactions.xlsx
